@@ -241,6 +241,7 @@ class PluginConfig:
     cooldown: int = 5
     max_screenshots_per_session: int = 3
     send_as_separate_message: bool = True
+    auto_delete_after: int = 0  # 秒，0=不自动删除
     napcat_http_url: str = "http://localhost:6099"
     napcat_token: str = ""
     screenshot_delay_ms: int = 300
@@ -262,6 +263,7 @@ class PluginConfig:
             cooldown=_clamp(int(cfg.get("cooldown", 5)), 0, 120),
             max_screenshots_per_session=_clamp(int(cfg.get("max_screenshots_per_session", 3)), 0, 20),
             send_as_separate_message=bool(cfg.get("send_as_separate_message", True)),
+            auto_delete_after=_clamp(int(cfg.get("auto_delete_after", 0)), 0, 300),
             napcat_http_url=str(cfg.get("napcat_http_url", "http://localhost:6099")).rstrip("/"),
             napcat_token=str(cfg.get("napcat_token", "")),
             screenshot_delay_ms=_clamp(int(cfg.get("screenshot_delay_ms", 300)), 0, 2000),
@@ -1107,8 +1109,8 @@ class NapcatScreenshot(Star):
 
     async def _send_image_message(self, event: AstrMessageEvent, img_bytes: bytes) -> bool:
         """
-        通过 bot client 发送图片消息。
-        支持群聊和私聊。
+        通过 bot client 发送图片消息，支持阅后即焚。
+        返回 message_id 供自动删除使用。
         """
         bot = None
         try:
@@ -1145,28 +1147,55 @@ class NapcatScreenshot(Star):
         except Exception:
             pass
 
+        msg_id = None
         try:
             if gid:
-                await bot.call_action(
+                resp = await bot.call_action(
                     "send_group_msg",
                     group_id=int(gid),
                     message=cq_image,
                 )
                 logger.info(f"[NapcatScreenshot] Image sent to group {gid}")
-                return True
             elif uid:
-                await bot.call_action(
+                resp = await bot.call_action(
                     "send_private_msg",
                     user_id=int(uid),
                     message=cq_image,
                 )
                 logger.info(f"[NapcatScreenshot] Image sent to user {uid}")
-                return True
             else:
                 logger.error("[NapcatScreenshot] Cannot determine target (no group_id or user_id)")
                 return False
+
+            # 提取 message_id
+            if isinstance(resp, dict):
+                msg_id = resp.get("message_id") or resp.get("data", {}).get("message_id")
+            if msg_id:
+                logger.info(f"[NapcatScreenshot] Image msg_id={msg_id}")
         except Exception as e:
             logger.error(f"[NapcatScreenshot] Failed to send image: {e}")
             return False
+
+        # ── 阅后即焚：延迟自动删除 ──
+        cfg = self._get_config()
+        if cfg.auto_delete_after > 0 and msg_id:
+            asyncio.create_task(
+                self._auto_delete_image(bot, msg_id, cfg.auto_delete_after)
+            )
+
+        return True
+
+    async def _auto_delete_image(self, bot, msg_id: int, delay_seconds: int) -> None:
+        """
+        在 delay_seconds 秒后自动撤回截图消息。
+
+        独立 task，不阻塞主流程。撤回失败忽略（可能是被管理员删了或超时）。
+        """
+        await asyncio.sleep(delay_seconds)
+        try:
+            await bot.call_action("delete_msg", message_id=int(msg_id))
+            logger.info(f"[NapcatScreenshot] Auto-deleted image msg_id={msg_id} after {delay_seconds}s")
+        except Exception as e:
+            logger.debug(f"[NapcatScreenshot] Failed to auto-delete msg_id={msg_id}: {e}")
 
 

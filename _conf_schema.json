@@ -35,6 +35,12 @@
     "default": true,
     "description": "截图作为独立消息发送（更像真人），关闭则尝试合并到回复中"
   },
+  "auto_delete_after": {
+    "type": "int",
+    "label": "阅后即焚(秒，0=关闭)",
+    "default": 0,
+    "description": "截图发送后N秒自动撤回。设为0禁用。建议10-30秒，最大300秒"
+  },
   "napcat_http_url": {
     "type": "string",
     "label": "NapCat HTTP API地址",
