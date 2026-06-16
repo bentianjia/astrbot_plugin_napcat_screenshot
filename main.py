@@ -50,44 +50,19 @@ SCREENSHOT_MARKER_RE = re.compile(
 # 注入 LLM 的系统提示词 — 告诉 LLM 它拥有截图能力
 # ---------------------------------------------------------------------------
 
-SCREENSHOT_SYSTEM_PROMPT = """## 截图能力 (Screenshot Capability)
+SCREENSHOT_SYSTEM_PROMPT = """## 截图工具
 
-你拥有截图能力，可以直接截取电脑屏幕上指定窗口或全屏的内容展示给用户。
+你可以截图。在回复中插入标记即可截图：
+- `[SCREENSHOT:窗口名]` → 截指定窗口（**默认用这个**）
+- `[SCREENSHOT]` → 全屏（仅当用户说"全屏/整个屏幕"时用）
 
-**截图模式：**
-1. `[SCREENSHOT:窗口名]` — **优先使用**，截取指定窗口（模糊匹配标题）
-2. `[SCREENSHOT]` — 全屏截图，用于以下场景：
-   - 用户/管理员明确要求看"整个屏幕""全部""全屏""桌面"
-   - 你自己判断截单个窗口不足以展示完整信息时
-   - 你不确定该截哪个窗口时
+**窗口名怎么写：** 用窗口标题中的关键词，如 Claude Code、VS Code、终端、Chrome、记事本。支持模糊匹配。
 
-**何时截图（像真人一样判断）：**
-- 用户询问某个任务的进度、状态、结果时
-- 用户说"看看""检查一下""现在什么情况"等想了解视觉状态时
-- 你需要展示终端输出、代码运行结果、下载进度、界面状态时
-- 当文字描述不够直观，一张截图能更好说明问题时
+**示例：**
+用户："Claude Code进度？" → `[SCREENSHOT:Claude Code]`
+用户："看看桌面" → `[SCREENSHOT]`
 
-**自然的回复示例：**
-用户："Claude Code开发到哪了？"
-你："让我截图看看 Claude Code 的进度 [SCREENSHOT:Claude Code]"
-
-用户："下载完成了吗？"
-你："我截个图确认一下 [SCREENSHOT:下载]"
-
-用户："帮我看看VS Code里有没有报错"
-你："好的，我看一下VS Code的终端输出 [SCREENSHOT:VS Code]"
-
-管理员："截个全屏看看整体情况"
-你："好的 [SCREENSHOT]"
-
-用户："现在电脑什么状态？"
-你："我截个全屏看看 [SCREENSHOT]"（自己判断全屏更合适）
-
-**重要规则：**
-- 只在确实需要视觉确认时才截图，不要滥用
-- 每次回复最多截图一次
-- 截图标记会被自动移除，用户看不到标记本身
-- **优先指定窗口名**，但你自己判断需要时也可以用全屏"""
+每次回复最多截图一次。标记会被自动移除。"""
 
 # ---------------------------------------------------------------------------
 # Win32 API 常量与结构体
@@ -408,213 +383,41 @@ class Win32ScreenCapture:
     @staticmethod
     def capture_window(hwnd: int) -> Optional[bytes]:
         """
-        捕获指定窗口的屏幕内容，返回 JPEG/BMP 字节。
+        使用 PIL ImageGrab 截取指定窗口的屏幕区域。
 
-        策略（按优先级）：
-          1. PrintWindow — 适用于 DWM 硬件加速窗口 (Win 8.1+)
-          2. BitBlt + CAPTUREBLT — 适用于传统 GDI 窗口
-          3. BitBlt only — 最后兜底
+        PIL 内部调用 Windows API 并正确处理像素格式、朝向、DPI 缩放，
+        不会产生镜像或翻转。需要 Pillow 已安装。
         """
+        if not HAS_PIL:
+            return None
+
         rect = Win32ScreenCapture.get_window_rect(hwnd)
         if not rect:
             return None
 
-        width = rect.right - rect.left
-        height = rect.bottom - rect.top
-
-        if width <= 0 or height <= 0:
-            return None
-
-        # 获取桌面 DC
-        hdc_screen = user32.GetDC(0)
-        if not hdc_screen:
-            return None
-
-        hdc_mem = gdi32.CreateCompatibleDC(hdc_screen)
-        hbitmap = gdi32.CreateCompatibleBitmap(hdc_screen, width, height)
-        if not hbitmap:
-            user32.ReleaseDC(0, hdc_screen)
-            return None
-
-        gdi32.SelectObject(hdc_mem, hbitmap)
-
-        success = False
-
-        # ── 方法 1: PrintWindow (适用于 DWM 合成窗口) ──
+        bbox = (rect.left, rect.top, rect.right, rect.bottom)
         try:
-            # PW_RENDERFULLCONTENT (0x2) = 捕获完整内容包括 DirectX 区域
-            flags = PW_CLIENTONLY | PW_RENDERFULLCONTENT  # 0x3
-            if user32.PrintWindow(hwnd, hdc_mem, flags):
-                success = True
-        except Exception:
-            pass
-
-        # ── 方法 2: BitBlt + CAPTUREBLT ──
-        if not success:
-            try:
-                success = gdi32.BitBlt(
-                    hdc_mem, 0, 0, width, height,
-                    hdc_screen, rect.left, rect.top,
-                    SRCCOPY | CAPTUREBLT
-                )
-            except Exception:
-                pass
-
-        # ── 方法 3: 纯 BitBlt ──
-        if not success:
-            try:
-                success = gdi32.BitBlt(
-                    hdc_mem, 0, 0, width, height,
-                    hdc_screen, rect.left, rect.top,
-                    SRCCOPY
-                )
-            except Exception:
-                pass
-
-        if not success:
-            gdi32.DeleteObject(hbitmap)
-            gdi32.DeleteDC(hdc_mem)
-            user32.ReleaseDC(0, hdc_screen)
+            img = ImageGrab.grab(bbox=bbox, all_screens=True)
+            buf = io.BytesIO()
+            img.convert("RGB").save(buf, format="JPEG", quality=85)
+            return buf.getvalue()
+        except Exception as e:
+            logger.error(f"[NapcatScreenshot] PIL window capture failed: {e}")
             return None
-
-        # 读取位图数据
-        bmp_info = BITMAPINFOHEADER()
-        bmp_info.biSize = ctypes.sizeof(BITMAPINFOHEADER)
-        bmp_info.biWidth = width
-        bmp_info.biHeight = height   # positive = bottom-up DIB (rows from bottom to top)
-        bmp_info.biPlanes = 1
-        bmp_info.biBitCount = 32
-        bmp_info.biCompression = 0  # BI_RGB
-
-        stride = ((width * 32 + 31) // 32) * 4
-        buf_size = stride * height
-        buf = ctypes.create_string_buffer(buf_size)
-
-        gdi32.GetDIBits(
-            hdc_mem, hbitmap, 0, height,
-            buf, ctypes.byref(bmp_info), 0  # DIB_RGB_COLORS
-        )
-
-        # 清理 GDI 资源
-        gdi32.DeleteObject(hbitmap)
-        gdi32.DeleteDC(hdc_mem)
-        user32.ReleaseDC(0, hdc_screen)
-
-        # 转换为 JPEG（如果 PIL 可用）或返回 BMP
-        if HAS_PIL:
-            return Win32ScreenCapture._raw_to_jpeg(buf, width, height, stride)
-        else:
-            return Win32ScreenCapture._raw_to_bmp(buf, width, height, stride)
-
-    @staticmethod
-    def _raw_to_jpeg(raw_buf, width: int, height: int, stride: int) -> bytes:
-        """
-        将 Win32 GetDIBits 返回的原始像素数据转为正确朝向的 JPEG。
-
-        GetDIBits 在 biHeight > 0 时返回 bottom-up DIB（底部行在前）。
-        Windows 32-bit 位图的像素格式为 BGRA（每像素 4 字节）。
-
-        处理步骤：
-          1. 逐像素 BGRA → RGBA（手动重排，避免 PIL raw decoder 行为差异）
-          2. 垂直翻转（bottom-up → top-down）
-          3. 转 JPEG 输出
-        """
-        raw = raw_buf.raw
-
-        # stride 可能大于 width*4（含行对齐填充字节），逐行拷贝有效像素
-        row_bytes = width * 4
-        rows = []
-        for y in range(height):
-            offset = y * stride
-            rows.append(raw[offset : offset + row_bytes])
-
-        # 手动 BGRA → RGBA + 垂直翻转（原数据首行 = 图像底部）
-        pixel_count = width * height
-        rgba = bytearray(pixel_count * 3)  # RGB only, 3 bytes per pixel
-
-        for src_y in range(height):
-            # bottom-up: src_y=0 是图像底部 → dst 应放到最后一行
-            dst_y = height - 1 - src_y
-            src_row = rows[src_y]
-            dst_offset = dst_y * width * 3
-
-            for x in range(width):
-                src_offset = x * 4
-                b = src_row[src_offset]
-                g = src_row[src_offset + 1]
-                r = src_row[src_offset + 2]
-                # 跳过 src_row[src_offset+3] (alpha, 未使用)
-
-                dst_idx = dst_offset + x * 3
-                rgba[dst_idx] = r
-                rgba[dst_idx + 1] = g
-                rgba[dst_idx + 2] = b
-
-        img = Image.frombytes("RGB", (width, height), bytes(rgba))
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=85)
-        return buf.getvalue()
-
-    @staticmethod
-    def _raw_to_bmp(raw_buf, width: int, height: int, stride: int) -> bytes:
-        """构造完整 BMP 文件（无 PIL 时使用）"""
-        # BMP 文件头 (14 bytes) + DIB 头 (40 bytes)
-        bmp_size = 14 + 40 + len(raw_buf.raw)
-        header = bytearray(14)
-        header[0:2] = b'BM'
-        struct.pack_into('<I', header, 2, bmp_size)  # 文件大小
-        struct.pack_into('<I', header, 10, 14 + 40)  # 像素数据偏移
-
-        dib = bytearray(40)
-        struct.pack_into('<I', dib, 0, 40)  # DIB 头大小
-        struct.pack_into('<i', dib, 4, width)
-        struct.pack_into('<i', dib, 8, height)
-        struct.pack_into('<H', dib, 12, 1)  # 平面数
-        struct.pack_into('<H', dib, 14, 32)  # 位深度
-        struct.pack_into('<I', dib, 16, 0)  # BI_RGB
-
-        return bytes(header) + bytes(dib) + raw_buf.raw
 
     @staticmethod
     def capture_full_screen() -> Optional[bytes]:
-        """截取整个屏幕"""
-        width = user32.GetSystemMetrics(0)   # SM_CXSCREEN
-        height = user32.GetSystemMetrics(1)  # SM_CYSCREEN
-
-        hdc_screen = user32.GetDC(0)
-        if not hdc_screen:
+        """使用 PIL ImageGrab 截取整个屏幕"""
+        if not HAS_PIL:
             return None
-
-        hdc_mem = gdi32.CreateCompatibleDC(hdc_screen)
-        hbitmap = gdi32.CreateCompatibleBitmap(hdc_screen, width, height)
-        gdi32.SelectObject(hdc_mem, hbitmap)
-        gdi32.BitBlt(
-            hdc_mem, 0, 0, width, height,
-            hdc_screen, 0, 0,
-            SRCCOPY | CAPTUREBLT
-        )
-
-        bmp_info = BITMAPINFOHEADER()
-        bmp_info.biSize = ctypes.sizeof(BITMAPINFOHEADER)
-        bmp_info.biWidth = width
-        bmp_info.biHeight = height   # positive = bottom-up DIB (rows from bottom to top)
-        bmp_info.biPlanes = 1
-        bmp_info.biBitCount = 32
-        bmp_info.biCompression = 0
-
-        stride = ((width * 32 + 31) // 32) * 4
-        buf_size = stride * height
-        buf = ctypes.create_string_buffer(buf_size)
-
-        gdi32.GetDIBits(hdc_mem, hbitmap, 0, height, buf, ctypes.byref(bmp_info), 0)
-
-        gdi32.DeleteObject(hbitmap)
-        gdi32.DeleteDC(hdc_mem)
-        user32.ReleaseDC(0, hdc_screen)
-
-        if HAS_PIL:
-            return Win32ScreenCapture._raw_to_jpeg(buf, width, height, stride)
-        return Win32ScreenCapture._raw_to_bmp(buf, width, height, stride)
+        try:
+            img = ImageGrab.grab(all_screens=True)
+            buf = io.BytesIO()
+            img.convert("RGB").save(buf, format="JPEG", quality=85)
+            return buf.getvalue()
+        except Exception as e:
+            logger.error(f"[NapcatScreenshot] PIL fullscreen capture failed: {e}")
+            return None
 
     @staticmethod
     def capture_target(target: str, delay_ms: int = 300) -> Tuple[Optional[bytes], str]:
@@ -622,11 +425,11 @@ class Win32ScreenCapture:
         根据目标字符串截图。
 
         策略：
-          1. 如果 target 非空，搜索匹配窗口 → 置于前台 → 截取该窗口
-          2. 如果窗口截图全黑（硬件加速窗口），回退全屏截图
-          3. 如果 target 为空或未找到窗口 → 截取全屏为主
+          1. target 非空 → 搜窗口 → 前台 → PIL 截图
+          2. target 为空 → 全屏截图
+          3. 窗口未找到 → 返回 None + 可用窗口列表（不回退全屏！）
 
-        返回: (image_bytes_or_None, description_of_what_was_captured)
+        返回: (image_bytes_or_None, description)
         """
         if delay_ms > 0:
             time.sleep(delay_ms / 1000.0)
@@ -638,77 +441,35 @@ class Win32ScreenCapture:
             if windows:
                 hwnd, title = windows[0]
                 logger.info(
-                    f"[NapcatScreenshot] Found window: '{title}' (hwnd={hwnd}) "
-                    f"for target '{target}'"
+                    f"[NapcatScreenshot] Matched window: '{title}' "
+                    f"for target='{target}'"
                 )
 
-                # 将窗口置于前台
                 Win32ScreenCapture.bring_window_to_front(hwnd)
-                # 等待窗口渲染（最少 200ms）
                 wait_ms = max(delay_ms, 200)
                 time.sleep(wait_ms / 1000.0)
 
                 img_bytes = Win32ScreenCapture.capture_window(hwnd)
                 if img_bytes:
-                    # 检查是否为黑屏（硬件加速窗口可能返回全黑）
-                    if Win32ScreenCapture._is_black_image(img_bytes):
-                        logger.warning(
-                            f"[NapcatScreenshot] Window '{title}' captured as black, "
-                            f"falling back to full screen"
-                        )
-                    else:
-                        return img_bytes, f"窗口「{title}」"
+                    return img_bytes, f"窗口「{title}」"
                 else:
                     logger.warning(
-                        f"[NapcatScreenshot] Failed to capture window '{title}', "
-                        f"falling back to full screen"
+                        f"[NapcatScreenshot] PIL capture failed for '{title}'"
                     )
+                    return None, f"截图失败：无法捕获窗口「{title}」"
+            else:
+                # 窗口未找到 — 列出当前可见窗口帮助 LLM 下次命中
+                logger.warning(
+                    f"[NapcatScreenshot] No window found for target='{target}'"
+                )
+                return None, f"未找到包含「{target}」的窗口"
 
-        # Fallback: 全屏截图
-        logger.info("[NapcatScreenshot] Capturing full screen")
+        # target 为空 → 全屏
+        logger.info("[NapcatScreenshot] Capturing full screen (no target specified)")
         img_bytes = Win32ScreenCapture.capture_full_screen()
         if img_bytes:
             return img_bytes, "全屏"
-        return None, ""
-
-    @staticmethod
-    def _is_black_image(img_bytes: bytes) -> bool:
-        """
-        检测图片是否全黑（PrintWindow 对某些 DWM 窗口会返回全黑）。
-        只检查 JPEG 头部附近的一些采样点。
-        """
-        if not HAS_PIL or len(img_bytes) < 1024:
-            return False
-        try:
-            img = Image.open(io.BytesIO(img_bytes))
-            # 缩小到 10x10 检查平均亮度
-            img_small = img.resize((10, 10), Image.LANCZOS)
-            pixels = list(img_small.convert("L").getdata())
-            avg_brightness = sum(pixels) / len(pixels)
-            return avg_brightness < 5  # 几乎全黑
-        except Exception:
-            return False
-
-
-# ---------------------------------------------------------------------------
-# PIL 截图引擎 (备用)
-# ---------------------------------------------------------------------------
-
-class PILScreenCapture:
-    """PIL/Pillow 截图引擎 — 作为备选方案"""
-
-    @staticmethod
-    def capture_full_screen() -> Optional[bytes]:
-        if not HAS_PIL:
-            return None
-        try:
-            img = ImageGrab.grab(all_screens=True)
-            buf = io.BytesIO()
-            img.convert("RGB").save(buf, format="JPEG", quality=85)
-            return buf.getvalue()
-        except Exception as e:
-            logger.error(f"[NapcatScreenshot] PIL screenshot failed: {e}")
-            return None
+        return None, "截图失败"
 
 
 # ---------------------------------------------------------------------------
@@ -821,9 +582,9 @@ class NapcatScreenshot(Star):
     支持窗口名模糊匹配：LLM 说 [SCREENSHOT:Claude Code] 即截取对应窗口。
 
     架构：
-      - Win32ScreenCapture: 主力引擎，用 Win32 API 直接捕获指定窗口
-      - PILScreenCapture:    备选，PIL ImageGrab 全屏
-      - NapcatAPICapture:    备选，NapCat HTTP API
+      - Win32ScreenCapture: 主力引擎，Win32 找窗口 + PIL ImageGrab 截图
+      - NapcatAPICapture:   备选，NapCat HTTP API
+      - Bot Action API:     备选，OneBot v11 action
     """
 
     def __init__(self, context: Context) -> None:
@@ -968,10 +729,10 @@ class NapcatScreenshot(Star):
                 event.set_result(event.plain_result(clean_text))
                 await self._send_image_message(event, img_bytes)
         else:
-            # 截图失败，发送清理后的文本
-            logger.error("[NapcatScreenshot] All screenshot methods failed")
+            # 截图失败，附带具体原因
+            logger.error(f"[NapcatScreenshot] Screenshot failed: {captured_desc}")
             event.set_result(event.plain_result(
-                clean_text + "\n\n[⚠ 截图失败，请检查目标窗口是否存在]"
+                clean_text + f"\n\n[⚠ 截图失败：{captured_desc}]"
             ))
 
     # ── 截图执行器 ────────────────────────────────────────────
@@ -1007,18 +768,7 @@ class NapcatScreenshot(Star):
             except Exception as e:
                 logger.warning(f"[NapcatScreenshot] Win32 capture failed: {e}")
 
-        # ── 方式 2: PIL 备选 ──
-        if not img_bytes and mode != "napcat_only":
-            try:
-                img_bytes = await asyncio.to_thread(
-                    PILScreenCapture.capture_full_screen
-                )
-                if img_bytes:
-                    captured_desc = "全屏(PIL)"
-            except Exception as e:
-                logger.warning(f"[NapcatScreenshot] PIL capture failed: {e}")
-
-        # ── 方式 3: NapCat HTTP API ──
+        # ── 方式 2: NapCat HTTP API ──
         if not img_bytes:
             try:
                 http = await self._get_http()
