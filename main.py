@@ -243,7 +243,7 @@ class PluginConfig:
     """插件配置"""
     enable: bool = True
     inject_system_prompt: bool = True
-    screenshot_mode: str = "window_first"  # window_first | fullscreen | napcat_only
+    screenshot_mode: str = "napcat_first"  # napcat_first | window_first | fullscreen | napcat_only
     cooldown: int = 5
     max_screenshots_per_session: int = 3
     send_as_separate_message: bool = True
@@ -265,7 +265,7 @@ class PluginConfig:
         return cls(
             enable=bool(cfg.get("enable", True)),
             inject_system_prompt=bool(cfg.get("inject_system_prompt", True)),
-            screenshot_mode=str(cfg.get("screenshot_mode", "window_first")),
+            screenshot_mode=str(cfg.get("screenshot_mode", "napcat_first")),
             cooldown=_clamp(int(cfg.get("cooldown", 5)), 0, 120),
             max_screenshots_per_session=_clamp(int(cfg.get("max_screenshots_per_session", 3)), 0, 20),
             send_as_separate_message=bool(cfg.get("send_as_separate_message", True)),
@@ -831,18 +831,31 @@ class NapcatScreenshot(Star):
         self, target: str, cfg: PluginConfig, event: AstrMessageEvent
     ) -> Tuple[Optional[bytes], str]:
         """
-        按优先级尝试多种截图方式：
-          1. Win32 窗口截图 (window_first / fullscreen 模式)
-          2. PIL 全屏截图 (window_first / fullscreen 模式)
-          3. NapCat HTTP API (napcat_only 模式或兜底)
+        截图优先级（从高到低）：
+          1. NapCat bot action (QQ自带截图，零朝向问题)  ← 主力
+          2. Win32窗口定位 + PIL截图（指定窗口时）
+          3. NapCat HTTP API
+          4. PIL 全屏兜底
         """
         img_bytes: Optional[bytes] = None
         captured_desc = ""
 
         mode = cfg.screenshot_mode
 
-        # ── 方式 1: Win32 原生截图 ──
-        if mode in ("window_first", "fullscreen"):
+        # ════════════════════════════════════════════════════════
+        # 方式 1: NapCat bot action — QQ 自带截图，最可靠
+        #          napcat_first / napcat_only 模式下优先
+        # ════════════════════════════════════════════════════════
+        if mode in ("napcat_first", "napcat_only"):
+            try:
+                img_bytes, captured_desc = await self._screenshot_via_bot_client(event)
+            except Exception as e:
+                logger.warning(f"[NapcatScreenshot] Bot action failed: {e}")
+
+        # ════════════════════════════════════════════════════════
+        # 方式 2: Win32窗口定位 + PIL截图（指定窗口时）
+        # ════════════════════════════════════════════════════════
+        if not img_bytes and mode in ("window_first", "fullscreen"):
             try:
                 if mode == "window_first":
                     img_bytes, captured_desc = await asyncio.to_thread(
@@ -858,7 +871,9 @@ class NapcatScreenshot(Star):
             except Exception as e:
                 logger.warning(f"[NapcatScreenshot] Win32 capture failed: {e}")
 
-        # ── 方式 2: NapCat HTTP API ──
+        # ════════════════════════════════════════════════════════
+        # 方式 3: NapCat HTTP API
+        # ════════════════════════════════════════════════════════
         if not img_bytes:
             try:
                 http = await self._get_http()
@@ -866,25 +881,20 @@ class NapcatScreenshot(Star):
                     http, cfg.napcat_http_url, cfg.napcat_token
                 )
                 if img_bytes:
-                    captured_desc = "NapCat API"
+                    captured_desc = "NapCat HTTP API"
             except Exception as e:
-                logger.warning(f"[NapcatScreenshot] NapCat API capture failed: {e}")
+                logger.warning(f"[NapcatScreenshot] NapCat HTTP failed: {e}")
 
-        # ── 方式 4: 尝试通过 bot client 调用 ──
-        if not img_bytes:
-            try:
-                img_bytes, captured_desc = await self._screenshot_via_bot_client(event)
-            except Exception as e:
-                logger.warning(f"[NapcatScreenshot] Bot client screenshot failed: {e}")
-
-        # ── 后处理：修复朝向 + 缩放大图 ──
+        # ════════════════════════════════════════════════════════
+        # 后处理：仅缩放（NapCat 截图已经是正的就不要乱翻）
+        # ════════════════════════════════════════════════════════
         if img_bytes:
             try:
                 img_bytes = await asyncio.to_thread(
                     self._post_process, img_bytes, cfg.max_image_width, cfg.image_quality
                 )
             except Exception:
-                pass  # 后处理失败不影响发送原图
+                pass
 
         return img_bytes, captured_desc
 

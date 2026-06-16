@@ -14,8 +14,8 @@
   "screenshot_mode": {
     "type": "string",
     "label": "截图模式",
-    "default": "window_first",
-    "description": "window_first=优先窗口截图(可指定目标), fullscreen=全屏截图, napcat_only=仅NapCatAPI"
+    "default": "napcat_first",
+    "description": "napcat_first=NapCatQQ截图优先(推荐), window_first=窗口定位优先, fullscreen=PIL全屏, napcat_only=仅NapCat"
   },
   "cooldown": {
     "type": "int",
