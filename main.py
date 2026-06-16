@@ -52,40 +52,42 @@ SCREENSHOT_MARKER_RE = re.compile(
 
 SCREENSHOT_SYSTEM_PROMPT = """## 截图能力 (Screenshot Capability)
 
-你拥有截图能力，可以直接截取电脑屏幕上指定窗口的内容，并展示给用户。
+你拥有截图能力，可以直接截取电脑屏幕上**指定窗口**的内容展示给用户。
+
+**核心原则：必须指定截图目标窗口！**
+- 每次截图**必须**在 `[SCREENSHOT:窗口名]` 中写明你要截哪个窗口
+- 根据用户问的内容推断窗口名：用户问 Claude Code 就截 Claude Code，问 VS Code 就截 VS Code
+- 窗口名支持模糊匹配，写关键词即可，如 "Claude Code"、"终端"、"浏览器"、"记事本" 等
+- **禁止**使用无目标的 `[SCREENSHOT]`，除非用户**明确说**"整个屏幕""全部""全屏""桌面"这类词
 
 **何时截图（像真人一样判断）：**
 - 用户询问某个任务的进度、状态、结果时
 - 用户说"看看""检查一下""现在什么情况"等想了解视觉状态时
 - 你需要展示终端输出、代码运行结果、下载进度、界面状态时
-- 用户让你操作某个软件后，想确认操作结果时
 - 当文字描述不够直观，一张截图能更好说明问题时
-
-**如何指定截图目标：**
-在你的回复中自然插入 `[SCREENSHOT:窗口名]` 标记。
-窗口名是你想截图的窗口标题的一部分（支持模糊匹配）：
-- `[SCREENSHOT:Claude Code]` — 截图 Claude Code 终端窗口
-- `[SCREENSHOT:VS Code]` — 截图 VS Code 窗口
-- `[SCREENSHOT:终端]` — 截图终端窗口
-- `[SCREENSHOT:浏览器]` — 截图浏览器窗口
-- `[SCREENSHOT]` — 不指定目标，截图当前活动窗口/全屏
 
 **自然的回复示例：**
 用户："Claude Code开发到哪了？"
 你："让我截图看看 Claude Code 的进度 [SCREENSHOT:Claude Code]"
+→ 截取 Claude Code 窗口 ✓
 
 用户："下载完成了吗？"
 你："我截个图确认一下 [SCREENSHOT:下载]"
+→ 截取下载相关窗口 ✓
 
 用户："帮我看看VS Code里有没有报错"
 你："好的，我看一下VS Code的终端输出 [SCREENSHOT:VS Code]"
+→ 截取 VS Code 窗口 ✓
 
-**注意：**
+用户（管理员）："截个全屏看看整体情况"
+你："好的，截个全屏 [SCREENSHOT]"
+→ 全屏截图 ✓（仅此情况）
+
+**重要规则：**
 - 只在确实需要视觉确认时才截图，不要滥用
 - 每次回复最多截图一次
 - 截图标记会被自动移除，用户看不到标记本身
-- 优先指定具体的窗口名，这样截图更精准
-- 如果你不确定窗口名，可以不指定目标或使用宽泛的关键词"""
+- **始终先思考用户关心的是哪个软件/窗口，然后在标记中写明**"""
 
 # ---------------------------------------------------------------------------
 # Win32 API 常量与结构体
@@ -479,7 +481,7 @@ class Win32ScreenCapture:
         bmp_info = BITMAPINFOHEADER()
         bmp_info.biSize = ctypes.sizeof(BITMAPINFOHEADER)
         bmp_info.biWidth = width
-        bmp_info.biHeight = height
+        bmp_info.biHeight = -height  # negative = top-down DIB, avoids vertical flip
         bmp_info.biPlanes = 1
         bmp_info.biBitCount = 32
         bmp_info.biCompression = 0  # BI_RGB
@@ -558,7 +560,7 @@ class Win32ScreenCapture:
         bmp_info = BITMAPINFOHEADER()
         bmp_info.biSize = ctypes.sizeof(BITMAPINFOHEADER)
         bmp_info.biWidth = width
-        bmp_info.biHeight = height
+        bmp_info.biHeight = -height  # negative = top-down DIB, avoids vertical flip
         bmp_info.biPlanes = 1
         bmp_info.biBitCount = 32
         bmp_info.biCompression = 0
