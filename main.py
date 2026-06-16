@@ -494,9 +494,9 @@ class Win32ScreenCapture:
 
     @staticmethod
     def _pil_to_jpeg(img: "Image.Image") -> bytes:
-        """PIL Image → JPEG bytes，不做任何翻转"""
+        """PIL Image → PNG bytes"""
         buf = io.BytesIO()
-        img.convert("RGB").save(buf, format="JPEG", quality=85)
+        img.convert("RGB").save(buf, format="PNG")
         return buf.getvalue()
 
     @staticmethod
@@ -891,10 +891,8 @@ class NapcatScreenshot(Star):
     @staticmethod
     def _post_process(img_bytes: bytes, max_width: int, quality: int) -> bytes:
         """
-        统一后处理：修正可能的翻转 + 缩放。
-
-        部分 Windows 截图 API 返回的图片可能因显卡 framebuffer
-        朝向问题导致上下颠倒和左右镜像。PIL 统一修正。
+        后处理：仅缩放，不做翻转。
+        用 PNG 格式消除 JPEG EXIF 朝向问题。
         """
         if not HAS_PIL:
             return img_bytes
@@ -902,27 +900,16 @@ class NapcatScreenshot(Star):
         try:
             img = Image.open(io.BytesIO(img_bytes))
 
-            # FLIP_TOP_BOTTOM: 修正上下颠倒
-            img = img.transpose(Image.FLIP_TOP_BOTTOM)
-            # FLIP_LEFT_RIGHT: 修正左右镜像
-            img = img.transpose(Image.FLIP_LEFT_RIGHT)
-
             # 缩放
             if max_width > 0 and img.width > max_width:
                 ratio = max_width / img.width
                 new_height = int(img.height * ratio)
                 img = img.resize((max_width, new_height), Image.LANCZOS)
 
+            # PNG — 无 EXIF，无损，避免任何朝向元数据干扰
             buf = io.BytesIO()
-            img.convert("RGB").save(buf, format="JPEG", quality=quality)
-            result = buf.getvalue()
-
-            # 日志确认
-            logger.debug(
-                f"[NapcatScreenshot] Post-process: flipped V+H, "
-                f"size={img.width}x{img.height}, bytes={len(result)}"
-            )
-            return result
+            img.convert("RGB").save(buf, format="PNG")
+            return buf.getvalue()
         except Exception:
             return img_bytes
 
@@ -1008,8 +995,8 @@ class NapcatScreenshot(Star):
 
     async def _send_image_message(self, event: AstrMessageEvent, img_bytes: bytes) -> bool:
         """
-        通过 bot client 发送图片消息，支持阅后即焚。
-        返回 message_id 供自动删除使用。
+        发送截图。先用 file:// 路径发（避开 base64 编码层），
+        失败再回退 base64。
         """
         bot = None
         try:
@@ -1026,15 +1013,6 @@ class NapcatScreenshot(Star):
             logger.error("[NapcatScreenshot] No bot client available to send image")
             return False
 
-        # 转 base64
-        try:
-            img_b64 = base64.b64encode(img_bytes).decode("ascii")
-        except Exception as e:
-            logger.error(f"[NapcatScreenshot] base64 encode failed: {e}")
-            return False
-
-        cq_image = f"[CQ:image,file=base64://{img_b64}]"
-
         gid = None
         uid = None
         try:
@@ -1046,43 +1024,96 @@ class NapcatScreenshot(Star):
         except Exception:
             pass
 
-        msg_id = None
+        # ── 方法 1: 写临时文件，发 file:// 路径 ──
+        import tempfile, os
+        tmp_path = ""
         try:
+            fd, tmp_path = tempfile.mkstemp(suffix=".png", prefix="napcat_ss_")
+            os.close(fd)
+            with open(tmp_path, "wb") as f:
+                f.write(img_bytes)
+
+            file_url = f"file:///{tmp_path.replace(chr(92), '/')}"
+            cq_image = f"[CQ:image,file={file_url}]"
+
             if gid:
                 resp = await bot.call_action(
-                    "send_group_msg",
-                    group_id=int(gid),
-                    message=cq_image,
+                    "send_group_msg", group_id=int(gid), message=cq_image,
                 )
-                logger.info(f"[NapcatScreenshot] Image sent to group {gid}")
             elif uid:
                 resp = await bot.call_action(
-                    "send_private_msg",
-                    user_id=int(uid),
-                    message=cq_image,
+                    "send_private_msg", user_id=int(uid), message=cq_image,
                 )
-                logger.info(f"[NapcatScreenshot] Image sent to user {uid}")
             else:
-                logger.error("[NapcatScreenshot] Cannot determine target (no group_id or user_id)")
+                logger.error("[NapcatScreenshot] Cannot determine target")
                 return False
 
-            # 提取 message_id
+            msg_id = None
             if isinstance(resp, dict):
                 msg_id = resp.get("message_id") or resp.get("data", {}).get("message_id")
-            if msg_id:
-                logger.info(f"[NapcatScreenshot] Image msg_id={msg_id}")
+
+            logger.info(f"[NapcatScreenshot] Image sent via file://, msg_id={msg_id}")
+
+            # 阅后即焚
+            cfg = self._get_config()
+            if cfg.auto_delete_after > 0 and msg_id:
+                asyncio.create_task(
+                    self._auto_delete_image(bot, msg_id, cfg.auto_delete_after)
+                )
+
+            # 延迟删临时文件
+            asyncio.create_task(self._cleanup_tmp(tmp_path, delay=30))
+            return True
+
         except Exception as e:
-            logger.error(f"[NapcatScreenshot] Failed to send image: {e}")
+            logger.warning(f"[NapcatScreenshot] file:// send failed: {e}, falling back to base64")
+            # 清理临时文件
+            if tmp_path:
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+
+        # ── 方法 2: base64 兜底 ──
+        try:
+            img_b64 = base64.b64encode(img_bytes).decode("ascii")
+            cq_image = f"[CQ:image,file=base64://{img_b64}]"
+
+            if gid:
+                resp = await bot.call_action(
+                    "send_group_msg", group_id=int(gid), message=cq_image,
+                )
+            elif uid:
+                resp = await bot.call_action(
+                    "send_private_msg", user_id=int(uid), message=cq_image,
+                )
+            else:
+                return False
+
+            msg_id = None
+            if isinstance(resp, dict):
+                msg_id = resp.get("message_id") or resp.get("data", {}).get("message_id")
+
+            cfg = self._get_config()
+            if cfg.auto_delete_after > 0 and msg_id:
+                asyncio.create_task(
+                    self._auto_delete_image(bot, msg_id, cfg.auto_delete_after)
+                )
+
+            logger.info(f"[NapcatScreenshot] Image sent via base64, msg_id={msg_id}")
+            return True
+        except Exception as e:
+            logger.error(f"[NapcatScreenshot] base64 send also failed: {e}")
             return False
 
-        # ── 阅后即焚：延迟自动删除 ──
-        cfg = self._get_config()
-        if cfg.auto_delete_after > 0 and msg_id:
-            asyncio.create_task(
-                self._auto_delete_image(bot, msg_id, cfg.auto_delete_after)
-            )
-
-        return True
+    async def _cleanup_tmp(self, path: str, delay: int = 30) -> None:
+        """延迟删除临时文件"""
+        await asyncio.sleep(delay)
+        try:
+            import os
+            os.remove(path)
+        except Exception:
+            pass
 
     async def _auto_delete_image(self, bot, msg_id: int, delay_seconds: int) -> None:
         """
