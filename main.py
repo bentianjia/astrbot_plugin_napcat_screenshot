@@ -149,6 +149,32 @@ user32.ShowWindow.restype = ctypes.wintypes.BOOL
 user32.EnumWindows.argtypes = [EnumWindowsProc, ctypes.wintypes.LPARAM]
 user32.EnumWindows.restype = ctypes.wintypes.BOOL
 
+# Foreground window management
+user32.GetForegroundWindow.argtypes = []
+user32.GetForegroundWindow.restype = ctypes.wintypes.HWND
+
+user32.GetWindowThreadProcessId.argtypes = [
+    ctypes.wintypes.HWND, ctypes.POINTER(ctypes.wintypes.DWORD)
+]
+user32.GetWindowThreadProcessId.restype = ctypes.wintypes.DWORD
+
+kernel32.GetCurrentThreadId.argtypes = []
+kernel32.GetCurrentThreadId.restype = ctypes.wintypes.DWORD
+
+user32.AttachThreadInput.argtypes = [
+    ctypes.wintypes.DWORD, ctypes.wintypes.DWORD, ctypes.wintypes.BOOL
+]
+user32.AttachThreadInput.restype = ctypes.wintypes.BOOL
+
+# SwitchToThisWindow (undocumented but works on all Windows versions)
+user32.SwitchToThisWindow.argtypes = [ctypes.wintypes.HWND, ctypes.wintypes.BOOL]
+user32.SwitchToThisWindow.restype = None
+
+# AllowSetForegroundWindow: BOOL AllowSetForegroundWindow(DWORD dwProcessId)
+# ASFW_ANY = 0xFFFFFFFF = allow any process to set foreground
+user32.AllowSetForegroundWindow.argtypes = [ctypes.wintypes.DWORD]
+user32.AllowSetForegroundWindow.restype = ctypes.wintypes.BOOL
+
 user32.GetDC.argtypes = [ctypes.wintypes.HWND]
 user32.GetDC.restype = ctypes.wintypes.HDC
 
@@ -197,13 +223,16 @@ gdi32.GetDIBits.argtypes = [
 gdi32.GetDIBits.restype = ctypes.c_int
 
 
-# Try importing PIL (commonly available)
+# Try importing PIL (Pillow) — required for screenshots
 try:
     from PIL import Image, ImageGrab
     HAS_PIL = True
 except ImportError:
     HAS_PIL = False
-    logger.warning("[NapcatScreenshot] PIL not available, will use Win32 GDI directly")
+    logger.warning(
+        "[NapcatScreenshot] ⚠ Pillow 未安装！截图功能将不可用。\n"
+        "    请执行: pip install Pillow"
+    )
 
 # ---------------------------------------------------------------------------
 # 配置
@@ -350,34 +379,81 @@ class Win32ScreenCapture:
     @staticmethod
     def bring_window_to_front(hwnd: int) -> bool:
         """
-        将目标窗口置于前台。
+        将目标窗口强行拉到前台。
 
-        使用多种 Windows API 技巧确保窗口焦点切换成功：
-          1. 如果窗口最小化，先恢复
-          2. 发送 ALT 键模拟（解除前台锁定）
-          3. SetForegroundWindow + BringWindowToTop
+        依次尝试 4 种方法突破 Windows 前台锁定：
+          1. AttachThreadInput — 挂载到前台线程获取权限
+          2. 模拟 Alt 键 — 让系统认为进程收到了用户输入
+          3. AllowSetForegroundWindow — 显式授权自身
+          4. SwitchToThisWindow — 不验证前台权限（最后手段）
         """
         try:
-            # 1. 恢复最小化的窗口
+            # 恢复最小化的窗口
             if user32.IsIconic(hwnd):
                 user32.ShowWindow(hwnd, 9)  # SW_RESTORE
 
-            # 2. 尝试通过 keybd_event 获取前台权限
-            # 模拟按一下 Alt 键来满足 SetForegroundWindow 的前置条件
-            ctypes.windll.user32.keybd_event(0x12, 0, 0, 0)  # VK_MENU (Alt) down
-            ctypes.windll.user32.keybd_event(0x12, 0, 2, 0)  # VK_MENU up
+            success = False
 
-            # 3. 设为前台窗口
-            user32.SetForegroundWindow(hwnd)
+            # ── 方法 1: AttachThreadInput ──
+            try:
+                current_thread = kernel32.GetCurrentThreadId()
+                fg_hwnd = user32.GetForegroundWindow()
+                fg_thread = user32.GetWindowThreadProcessId(fg_hwnd, None)
 
-            # 4. 短暂等待 DWM 动画
+                attached = False
+                if current_thread != fg_thread and fg_thread:
+                    attached = bool(user32.AttachThreadInput(
+                        current_thread, fg_thread, True
+                    ))
+
+                success = bool(user32.SetForegroundWindow(hwnd))
+
+                if attached:
+                    user32.AttachThreadInput(current_thread, fg_thread, False)
+            except Exception:
+                pass
+
+            # ── 方法 2: 模拟 Alt 键获取前台权限 ──
+            if not success:
+                try:
+                    # Alt down → up，让系统认为进程收到了输入
+                    user32.keybd_event(0x12, 0, 0, 0)  # VK_MENU
+                    user32.keybd_event(0x12, 0, 2, 0)
+                    success = bool(user32.SetForegroundWindow(hwnd))
+                except Exception:
+                    pass
+
+            # ── 方法 3: AllowSetForegroundWindow ──
+            if not success:
+                try:
+                    # ASFW_ANY = 0xFFFFFFFF → 允许任何进程设置前台
+                    user32.AllowSetForegroundWindow(0xFFFFFFFF)
+                    success = bool(user32.SetForegroundWindow(hwnd))
+                except Exception:
+                    pass
+
+            # ── 方法 4: SwitchToThisWindow（激进，绕过所有检查）──
+            if not success:
+                try:
+                    user32.SwitchToThisWindow(hwnd, True)
+                    success = True
+                except Exception:
+                    pass
+
+            # 提至最顶层
             time.sleep(0.05)
-
-            # 5. 放到最上层
             user32.BringWindowToTop(hwnd)
 
-            return True
-        except Exception:
+            if success:
+                logger.info(f"[NapcatScreenshot] Window brought to front: hwnd={hwnd}")
+            else:
+                logger.warning(
+                    f"[NapcatScreenshot] Failed to bring window to front: hwnd={hwnd}"
+                )
+
+            return True  # 即使前台失败也继续截图（窗口可能部分可见）
+        except Exception as e:
+            logger.warning(f"[NapcatScreenshot] bring_window_to_front error: {e}")
             return False
 
     @staticmethod
@@ -385,10 +461,10 @@ class Win32ScreenCapture:
         """
         使用 PIL ImageGrab 截取指定窗口的屏幕区域。
 
-        PIL 内部调用 Windows API 并正确处理像素格式、朝向、DPI 缩放，
-        不会产生镜像或翻转。需要 Pillow 已安装。
+        PIL 内部调用 Windows API 并正确处理像素格式和 DPI 缩放。
         """
         if not HAS_PIL:
+            logger.error("[NapcatScreenshot] PIL 未安装，无法截图窗口")
             return None
 
         rect = Win32ScreenCapture.get_window_rect(hwnd)
@@ -398,9 +474,7 @@ class Win32ScreenCapture:
         bbox = (rect.left, rect.top, rect.right, rect.bottom)
         try:
             img = ImageGrab.grab(bbox=bbox, all_screens=True)
-            buf = io.BytesIO()
-            img.convert("RGB").save(buf, format="JPEG", quality=85)
-            return buf.getvalue()
+            return Win32ScreenCapture._pil_to_jpeg(img)
         except Exception as e:
             logger.error(f"[NapcatScreenshot] PIL window capture failed: {e}")
             return None
@@ -409,15 +483,21 @@ class Win32ScreenCapture:
     def capture_full_screen() -> Optional[bytes]:
         """使用 PIL ImageGrab 截取整个屏幕"""
         if not HAS_PIL:
+            logger.error("[NapcatScreenshot] PIL 未安装，无法截图全屏")
             return None
         try:
             img = ImageGrab.grab(all_screens=True)
-            buf = io.BytesIO()
-            img.convert("RGB").save(buf, format="JPEG", quality=85)
-            return buf.getvalue()
+            return Win32ScreenCapture._pil_to_jpeg(img)
         except Exception as e:
             logger.error(f"[NapcatScreenshot] PIL fullscreen capture failed: {e}")
             return None
+
+    @staticmethod
+    def _pil_to_jpeg(img: "Image.Image") -> bytes:
+        """PIL Image → JPEG bytes，不做任何翻转"""
+        buf = io.BytesIO()
+        img.convert("RGB").save(buf, format="JPEG", quality=85)
+        return buf.getvalue()
 
     @staticmethod
     def capture_target(target: str, delay_ms: int = 300) -> Tuple[Optional[bytes], str]:
@@ -594,6 +674,16 @@ class NapcatScreenshot(Star):
         self._last_screenshot_time: float = 0.0
         self._session_screenshot_count: int = 0
         self._session_id: str = ""
+
+        # 启动时明确告知 PIL 状态
+        if HAS_PIL:
+            logger.info("[NapcatScreenshot] ✓ PIL/Pillow 已就绪，截图引擎正常")
+        else:
+            logger.error(
+                "[NapcatScreenshot] ✗ PIL/Pillow 未安装！\n"
+                "    请执行: pip install Pillow\n"
+                "    没有 PIL 将无法截图！"
+            )
 
     # ── 配置 ────────────────────────────────────────────────
 
