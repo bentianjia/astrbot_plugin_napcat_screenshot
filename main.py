@@ -877,16 +877,54 @@ class NapcatScreenshot(Star):
             except Exception as e:
                 logger.warning(f"[NapcatScreenshot] Bot client screenshot failed: {e}")
 
-        # ── 后处理：缩放大图 ──
-        if img_bytes and cfg.max_image_width > 0:
+        # ── 后处理：修复朝向 + 缩放大图 ──
+        if img_bytes:
             try:
                 img_bytes = await asyncio.to_thread(
-                    self._resize_image, img_bytes, cfg.max_image_width, cfg.image_quality
+                    self._post_process, img_bytes, cfg.max_image_width, cfg.image_quality
                 )
             except Exception:
-                pass  # 缩放失败不影响发送原图
+                pass  # 后处理失败不影响发送原图
 
         return img_bytes, captured_desc
+
+    @staticmethod
+    def _post_process(img_bytes: bytes, max_width: int, quality: int) -> bytes:
+        """
+        统一后处理：修正可能的翻转 + 缩放。
+
+        部分 Windows 截图 API 返回的图片可能因显卡 framebuffer
+        朝向问题导致上下颠倒和左右镜像。PIL 统一修正。
+        """
+        if not HAS_PIL:
+            return img_bytes
+
+        try:
+            img = Image.open(io.BytesIO(img_bytes))
+
+            # FLIP_TOP_BOTTOM: 修正上下颠倒
+            img = img.transpose(Image.FLIP_TOP_BOTTOM)
+            # FLIP_LEFT_RIGHT: 修正左右镜像
+            img = img.transpose(Image.FLIP_LEFT_RIGHT)
+
+            # 缩放
+            if max_width > 0 and img.width > max_width:
+                ratio = max_width / img.width
+                new_height = int(img.height * ratio)
+                img = img.resize((max_width, new_height), Image.LANCZOS)
+
+            buf = io.BytesIO()
+            img.convert("RGB").save(buf, format="JPEG", quality=quality)
+            result = buf.getvalue()
+
+            # 日志确认
+            logger.debug(
+                f"[NapcatScreenshot] Post-process: flipped V+H, "
+                f"size={img.width}x{img.height}, bytes={len(result)}"
+            )
+            return result
+        except Exception:
+            return img_bytes
 
     async def _screenshot_via_bot_client(self, event: AstrMessageEvent) -> Tuple[Optional[bytes], str]:
         """
@@ -965,24 +1003,6 @@ class NapcatScreenshot(Star):
                         except Exception:
                             pass
         return None
-
-    @staticmethod
-    def _resize_image(img_bytes: bytes, max_width: int, quality: int) -> bytes:
-        """缩放图片至指定最大宽度"""
-        if not HAS_PIL:
-            return img_bytes
-        try:
-            img = Image.open(io.BytesIO(img_bytes))
-            if img.width > max_width:
-                ratio = max_width / img.width
-                new_height = int(img.height * ratio)
-                img = img.resize((max_width, new_height), Image.LANCZOS)
-                buf = io.BytesIO()
-                img.convert("RGB").save(buf, format="JPEG", quality=quality)
-                return buf.getvalue()
-        except Exception:
-            pass
-        return img_bytes
 
     # ── 发送图片消息 ──────────────────────────────────────────
 
