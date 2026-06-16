@@ -70,5 +70,11 @@
     "label": "图片最大宽度(像素)",
     "default": 1920,
     "description": "超过此宽度会自动缩放，0=不限制"
+  },
+  "flip_correction": {
+    "type": "string",
+    "label": "截图翻转修正",
+    "default": "both",
+    "description": "截图朝向修正: both=上下+左右, v=仅上下, h=仅左右, none=不修正。默认both适应大部分显卡framebuffer"
   }
 }

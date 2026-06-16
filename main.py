@@ -40,9 +40,14 @@ from astrbot.api import logger
 # 常量
 # ---------------------------------------------------------------------------
 
-# LLM 截图标记正则：匹配 [SCREENSHOT:目标窗口] 或 [SCREENSHOT]
+# LLM 截图标记正则 — 兼容中英文冒号，支持各种空格
 SCREENSHOT_MARKER_RE = re.compile(
-    r'\[SCREENSHOT(?::\s*([^\]]*?))?\s*\]',
+    r'\[SCREENSHOT\s*[:：]\s*([^\]]*?)\s*\]|\[SCREENSHOT\s*\]',
+    re.IGNORECASE
+)
+# 中文自然语言截图意图检测
+SCREENSHOT_INTENT_RE = re.compile(
+    r'(截图|截个图|屏幕截图|screenshot|看看.{0,4}(进度|状态|情况|界面|窗口|桌面|屏幕))',
     re.IGNORECASE
 )
 
@@ -52,17 +57,20 @@ SCREENSHOT_MARKER_RE = re.compile(
 
 SCREENSHOT_SYSTEM_PROMPT = """## 截图工具
 
-你可以截图。在回复中插入标记即可截图：
-- `[SCREENSHOT:窗口名]` → 截指定窗口（**默认用这个**）
-- `[SCREENSHOT]` → 全屏（仅当用户说"全屏/整个屏幕"时用）
+每次截图**必须指定窗口名**，格式：`[SCREENSHOT:关键词]`
 
-**窗口名怎么写：** 用窗口标题中的关键词，如 Claude Code、VS Code、终端、Chrome、记事本。支持模糊匹配。
+规则（严格遵循）：
+- 用户问什么软件/窗口就截什么：Claude Code→[SCREENSHOT:Claude Code]，VS Code→[SCREENSHOT:VS Code]，终端→[SCREENSHOT:终端]，浏览器→[SCREENSHOT:Chrome]
+- 从用户消息中提取窗口关键词，不要自己编
+- 用户没说具体软件时，猜最可能的：写代码→VS Code或Claude Code，上网→浏览器，文件→资源管理器
+- **禁止**用 [SCREENSHOT] 不写窗口名，除非用户明确说"全屏""整个屏幕""桌面"
 
-**示例：**
-用户："Claude Code进度？" → `[SCREENSHOT:Claude Code]`
-用户："看看桌面" → `[SCREENSHOT]`
+示例——
+用户："Claude Code开发到哪了" → `[SCREENSHOT:Claude Code]`
+用户："看看VS Code有没有报错" → `[SCREENSHOT:VS Code]`
+用户："截个全屏" → `[SCREENSHOT]`
 
-每次回复最多截图一次。标记会被自动移除。"""
+每次回复最多一个截图标记。"""
 
 # ---------------------------------------------------------------------------
 # Win32 API 常量与结构体
@@ -253,6 +261,7 @@ class PluginConfig:
     screenshot_delay_ms: int = 300
     image_quality: int = 85
     max_image_width: int = 1920
+    flip_correction: str = "both"  # none | v | h | both — 截图朝向修正
 
     @classmethod
     def from_context(cls, context: Context) -> "PluginConfig":
@@ -275,6 +284,7 @@ class PluginConfig:
             screenshot_delay_ms=_clamp(int(cfg.get("screenshot_delay_ms", 300)), 0, 2000),
             image_quality=_clamp(int(cfg.get("image_quality", 85)), 10, 100),
             max_image_width=_clamp(int(cfg.get("max_image_width", 1920)), 0, 7680),
+            flip_correction=str(cfg.get("flip_correction", "both")),
         )
 
 
@@ -700,6 +710,52 @@ class NapcatScreenshot(Star):
             )
         return self._http
 
+    # ── 窗口名推断 ──────────────────────────────────────────
+
+    @staticmethod
+    def _guess_window(user_msg: str) -> str:
+        """
+        LLM 没指定窗口时，从用户消息中提取窗口关键词。
+
+        常见软件→窗口标题关键词映射。
+        """
+        if not user_msg:
+            return ""
+
+        msg = user_msg.lower()
+        # 按优先级匹配
+        keywords = [
+            # (消息关键词, 窗口关键词)
+            ("claude code", "Claude Code"),
+            ("claude", "Claude Code"),
+            ("vs code", "VS Code"),
+            ("vscode", "VS Code"),
+            ("终端", "终端"),
+            ("terminal", "终端"),
+            ("浏览器", "Chrome"),
+            ("chrome", "Chrome"),
+            ("edge", "Edge"),
+            ("记事本", "记事本"),
+            ("notepad", "记事本"),
+            ("资源管理器", "资源管理器"),
+            ("explorer", "资源管理器"),
+            ("下载", "下载"),
+            ("音乐", "音乐"),
+            ("视频", "视频"),
+            ("设置", "设置"),
+            ("控制面板", "控制面板"),
+            ("任务管理器", "任务管理器"),
+            ("桌面", ""),  # 桌面=全屏
+            ("全屏", ""),
+            ("整个屏幕", ""),
+        ]
+
+        for kw, window_title in keywords:
+            if kw in msg:
+                return window_title
+
+        return ""
+
     # ── 会话追踪 ────────────────────────────────────────────
 
     def _get_session_key(self, event: AstrMessageEvent) -> str:
@@ -776,7 +832,17 @@ class NapcatScreenshot(Star):
             return
 
         target = (match.group(1) or "").strip()
-        logger.info(f"[NapcatScreenshot] LLM requested screenshot, target='{target}'")
+
+        # 如果 LLM 没指定窗口，从用户消息中提取
+        if not target:
+            user_msg = _get_event_text(event)
+            target = self._guess_window(user_msg)
+            if target:
+                logger.info(
+                    f"[NapcatScreenshot] LLM没指定窗口，从用户消息推断: '{target}'"
+                )
+
+        logger.info(f"[NapcatScreenshot] Screenshot target='{target or '(全屏)'}'")
 
         # 检查冷却时间
         now = time.time()
@@ -886,12 +952,13 @@ class NapcatScreenshot(Star):
                 logger.warning(f"[NapcatScreenshot] NapCat HTTP failed: {e}")
 
         # ════════════════════════════════════════════════════════
-        # 后处理：仅缩放（NapCat 截图已经是正的就不要乱翻）
+        # 后处理：翻转修正 + 缩放
         # ════════════════════════════════════════════════════════
         if img_bytes:
             try:
                 img_bytes = await asyncio.to_thread(
-                    self._post_process, img_bytes, cfg.max_image_width, cfg.image_quality
+                    self._post_process, img_bytes,
+                    cfg.max_image_width, cfg.image_quality, cfg.flip_correction,
                 )
             except Exception:
                 pass
@@ -899,16 +966,35 @@ class NapcatScreenshot(Star):
         return img_bytes, captured_desc
 
     @staticmethod
-    def _post_process(img_bytes: bytes, max_width: int, quality: int) -> bytes:
+    def _post_process(img_bytes: bytes, max_width: int, quality: int,
+                      flip: str = "both") -> bytes:
         """
-        后处理：仅缩放，不做翻转。
-        用 PNG 格式消除 JPEG EXIF 朝向问题。
+        后处理：numpy 翻转 + 缩放。
+
+        flip 参数:
+          "both"  — np.flipud + np.fliplr (180°旋转, 默认)
+          "v"     — 仅 np.flipud (上下翻转)
+          "h"     — 仅 np.fliplr (左右镜像)
+          "none"  — 不翻转仅缩放
+
+        numpy 直接操作像素数组，不存在 PIL transpose 实现差异。
         """
         if not HAS_PIL:
             return img_bytes
 
         try:
+            import numpy as np
+
             img = Image.open(io.BytesIO(img_bytes))
+            arr = np.array(img.convert("RGB"))
+
+            # 按配置翻转
+            if flip == "both" or flip == "v":
+                arr = np.flipud(arr)
+            if flip == "both" or flip == "h":
+                arr = np.fliplr(arr)
+
+            img = Image.fromarray(arr)
 
             # 缩放
             if max_width > 0 and img.width > max_width:
@@ -916,9 +1002,8 @@ class NapcatScreenshot(Star):
                 new_height = int(img.height * ratio)
                 img = img.resize((max_width, new_height), Image.LANCZOS)
 
-            # PNG — 无 EXIF，无损，避免任何朝向元数据干扰
             buf = io.BytesIO()
-            img.convert("RGB").save(buf, format="PNG")
+            img.save(buf, format="PNG")
             return buf.getvalue()
         except Exception:
             return img_bytes
