@@ -1,0 +1,68 @@
+{
+  "enable": {
+    "type": "bool",
+    "label": "启用插件",
+    "default": true,
+    "description": "是否启用截图功能"
+  },
+  "inject_system_prompt": {
+    "type": "bool",
+    "label": "注入截图提示词",
+    "default": true,
+    "description": "在LLM系统提示中注入截图能力说明。开启后LLM会知道自己可以截图"
+  },
+  "screenshot_mode": {
+    "type": "string",
+    "label": "截图模式",
+    "default": "window_first",
+    "description": "window_first=优先窗口截图(可指定目标), fullscreen=全屏截图, napcat_only=仅NapCatAPI"
+  },
+  "cooldown": {
+    "type": "int",
+    "label": "截图冷却(秒)",
+    "default": 5,
+    "description": "两次截图之间的最小间隔，防止频繁截图"
+  },
+  "max_screenshots_per_session": {
+    "type": "int",
+    "label": "每轮对话最大截图数",
+    "default": 3,
+    "description": "每次agent会话中最多截图次数，防止滥用"
+  },
+  "send_as_separate_message": {
+    "type": "bool",
+    "label": "独立消息发送截图",
+    "default": true,
+    "description": "截图作为独立消息发送（更像真人），关闭则尝试合并到回复中"
+  },
+  "napcat_http_url": {
+    "type": "string",
+    "label": "NapCat HTTP API地址",
+    "default": "http://localhost:6099",
+    "description": "NapCat的HTTP API地址，用于fallback截图"
+  },
+  "napcat_token": {
+    "type": "string",
+    "label": "NapCat API Token",
+    "default": "",
+    "description": "NapCat HTTP API的访问令牌（如有设置）"
+  },
+  "screenshot_delay_ms": {
+    "type": "int",
+    "label": "截图前延迟(毫秒)",
+    "default": 300,
+    "description": "截图前等待时间，用于窗口切换等。0-2000ms"
+  },
+  "image_quality": {
+    "type": "int",
+    "label": "图片质量(1-100)",
+    "default": 85,
+    "description": "JPEG压缩质量，越高越清晰但文件越大"
+  },
+  "max_image_width": {
+    "type": "int",
+    "label": "图片最大宽度(像素)",
+    "default": 1920,
+    "description": "超过此宽度会自动缩放，0=不限制"
+  }
+}
