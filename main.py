@@ -52,13 +52,14 @@ SCREENSHOT_MARKER_RE = re.compile(
 
 SCREENSHOT_SYSTEM_PROMPT = """## 截图能力 (Screenshot Capability)
 
-你拥有截图能力，可以直接截取电脑屏幕上**指定窗口**的内容展示给用户。
+你拥有截图能力，可以直接截取电脑屏幕上指定窗口或全屏的内容展示给用户。
 
-**核心原则：必须指定截图目标窗口！**
-- 每次截图**必须**在 `[SCREENSHOT:窗口名]` 中写明你要截哪个窗口
-- 根据用户问的内容推断窗口名：用户问 Claude Code 就截 Claude Code，问 VS Code 就截 VS Code
-- 窗口名支持模糊匹配，写关键词即可，如 "Claude Code"、"终端"、"浏览器"、"记事本" 等
-- **禁止**使用无目标的 `[SCREENSHOT]`，除非用户**明确说**"整个屏幕""全部""全屏""桌面"这类词
+**截图模式：**
+1. `[SCREENSHOT:窗口名]` — **优先使用**，截取指定窗口（模糊匹配标题）
+2. `[SCREENSHOT]` — 全屏截图，用于以下场景：
+   - 用户/管理员明确要求看"整个屏幕""全部""全屏""桌面"
+   - 你自己判断截单个窗口不足以展示完整信息时
+   - 你不确定该截哪个窗口时
 
 **何时截图（像真人一样判断）：**
 - 用户询问某个任务的进度、状态、结果时
@@ -69,25 +70,24 @@ SCREENSHOT_SYSTEM_PROMPT = """## 截图能力 (Screenshot Capability)
 **自然的回复示例：**
 用户："Claude Code开发到哪了？"
 你："让我截图看看 Claude Code 的进度 [SCREENSHOT:Claude Code]"
-→ 截取 Claude Code 窗口 ✓
 
 用户："下载完成了吗？"
 你："我截个图确认一下 [SCREENSHOT:下载]"
-→ 截取下载相关窗口 ✓
 
 用户："帮我看看VS Code里有没有报错"
 你："好的，我看一下VS Code的终端输出 [SCREENSHOT:VS Code]"
-→ 截取 VS Code 窗口 ✓
 
-用户（管理员）："截个全屏看看整体情况"
-你："好的，截个全屏 [SCREENSHOT]"
-→ 全屏截图 ✓（仅此情况）
+管理员："截个全屏看看整体情况"
+你："好的 [SCREENSHOT]"
+
+用户："现在电脑什么状态？"
+你："我截个全屏看看 [SCREENSHOT]"（自己判断全屏更合适）
 
 **重要规则：**
 - 只在确实需要视觉确认时才截图，不要滥用
 - 每次回复最多截图一次
 - 截图标记会被自动移除，用户看不到标记本身
-- **始终先思考用户关心的是哪个软件/窗口，然后在标记中写明**"""
+- **优先指定窗口名**，但你自己判断需要时也可以用全屏"""
 
 # ---------------------------------------------------------------------------
 # Win32 API 常量与结构体
@@ -481,7 +481,7 @@ class Win32ScreenCapture:
         bmp_info = BITMAPINFOHEADER()
         bmp_info.biSize = ctypes.sizeof(BITMAPINFOHEADER)
         bmp_info.biWidth = width
-        bmp_info.biHeight = -height  # negative = top-down DIB, avoids vertical flip
+        bmp_info.biHeight = height   # positive = bottom-up DIB (rows from bottom to top)
         bmp_info.biPlanes = 1
         bmp_info.biBitCount = 32
         bmp_info.biCompression = 0  # BI_RGB
@@ -508,14 +508,51 @@ class Win32ScreenCapture:
 
     @staticmethod
     def _raw_to_jpeg(raw_buf, width: int, height: int, stride: int) -> bytes:
-        """将原始 BGRA 像素转为 JPEG"""
-        # 原始数据是 BGRA，需要转为 RGB
-        img = Image.frombytes("RGBA", (width, height), raw_buf.raw, "raw", "BGRA")
-        # 移除 alpha 通道
-        img_rgb = img.convert("RGB")
-        # 转为 JPEG
+        """
+        将 Win32 GetDIBits 返回的原始像素数据转为正确朝向的 JPEG。
+
+        GetDIBits 在 biHeight > 0 时返回 bottom-up DIB（底部行在前）。
+        Windows 32-bit 位图的像素格式为 BGRA（每像素 4 字节）。
+
+        处理步骤：
+          1. 逐像素 BGRA → RGBA（手动重排，避免 PIL raw decoder 行为差异）
+          2. 垂直翻转（bottom-up → top-down）
+          3. 转 JPEG 输出
+        """
+        raw = raw_buf.raw
+
+        # stride 可能大于 width*4（含行对齐填充字节），逐行拷贝有效像素
+        row_bytes = width * 4
+        rows = []
+        for y in range(height):
+            offset = y * stride
+            rows.append(raw[offset : offset + row_bytes])
+
+        # 手动 BGRA → RGBA + 垂直翻转（原数据首行 = 图像底部）
+        pixel_count = width * height
+        rgba = bytearray(pixel_count * 3)  # RGB only, 3 bytes per pixel
+
+        for src_y in range(height):
+            # bottom-up: src_y=0 是图像底部 → dst 应放到最后一行
+            dst_y = height - 1 - src_y
+            src_row = rows[src_y]
+            dst_offset = dst_y * width * 3
+
+            for x in range(width):
+                src_offset = x * 4
+                b = src_row[src_offset]
+                g = src_row[src_offset + 1]
+                r = src_row[src_offset + 2]
+                # 跳过 src_row[src_offset+3] (alpha, 未使用)
+
+                dst_idx = dst_offset + x * 3
+                rgba[dst_idx] = r
+                rgba[dst_idx + 1] = g
+                rgba[dst_idx + 2] = b
+
+        img = Image.frombytes("RGB", (width, height), bytes(rgba))
         buf = io.BytesIO()
-        img_rgb.save(buf, format="JPEG", quality=85)
+        img.save(buf, format="JPEG", quality=85)
         return buf.getvalue()
 
     @staticmethod
@@ -560,7 +597,7 @@ class Win32ScreenCapture:
         bmp_info = BITMAPINFOHEADER()
         bmp_info.biSize = ctypes.sizeof(BITMAPINFOHEADER)
         bmp_info.biWidth = width
-        bmp_info.biHeight = -height  # negative = top-down DIB, avoids vertical flip
+        bmp_info.biHeight = height   # positive = bottom-up DIB (rows from bottom to top)
         bmp_info.biPlanes = 1
         bmp_info.biBitCount = 32
         bmp_info.biCompression = 0
