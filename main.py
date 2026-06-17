@@ -40,9 +40,9 @@ from astrbot.api import logger
 # 常量
 # ---------------------------------------------------------------------------
 
-# LLM 截图标记正则 — 兼容中英文冒号，支持各种空格
+# LLM 截图标记正则 — 兼容中英文冒号，支持各种空格，支持指定截图区域
 SCREENSHOT_MARKER_RE = re.compile(
-    r'\[SCREENSHOT\s*[:：]\s*([^\]]*?)\s*\]|\[SCREENSHOT\s*\]',
+    r'\[SCREENSHOT(?:[:：]\s*([^\]\|]*?))?(?:\|\s*([^\]]*?))?\s*\]',
     re.IGNORECASE
 )
 # 中文自然语言截图意图检测
@@ -57,10 +57,11 @@ SCREENSHOT_INTENT_RE = re.compile(
 
 SCREENSHOT_SYSTEM_PROMPT = """## 截图工具
 
-每次截图**必须指定窗口名**，格式：`[SCREENSHOT:关键词]`
+每次截图**必须指定窗口名**，格式：`[SCREENSHOT:关键词]` 或 `[SCREENSHOT:关键词|x,y,宽度,高度]`
 
 规则（严格遵循）：
 - 用户问什么软件/窗口就截什么：Claude Code→[SCREENSHOT:Claude Code]，VS Code→[SCREENSHOT:VS Code]，终端→[SCREENSHOT:终端]，浏览器→[SCREENSHOT:Chrome]
+- 如果你需要截取特定区域，可以加上位置和大小（相对于目标窗口的左上角，或全屏时的屏幕左上角），例如：`[SCREENSHOT:VS Code|100,100,800,600]`
 - 从用户消息中提取窗口关键词，不要自己编
 - 用户没说具体软件时，猜最可能的：写代码→VS Code或Claude Code，上网→浏览器，文件→资源管理器
 - **禁止**用 [SCREENSHOT] 不写窗口名，除非用户明确说"全屏""整个屏幕""桌面"
@@ -69,6 +70,7 @@ SCREENSHOT_SYSTEM_PROMPT = """## 截图工具
 用户："Claude Code开发到哪了" → `[SCREENSHOT:Claude Code]`
 用户："看看VS Code有没有报错" → `[SCREENSHOT:VS Code]`
 用户："截个全屏" → `[SCREENSHOT]`
+用户："截取浏览器右上角的区域" → `[SCREENSHOT:Chrome|800,0,400,300]`
 
 每次回复最多一个截图标记。"""
 
@@ -251,7 +253,7 @@ class PluginConfig:
     """插件配置"""
     enable: bool = True
     inject_system_prompt: bool = True
-    screenshot_mode: str = "napcat_first"  # napcat_first | window_first | fullscreen | napcat_only
+    screenshot_mode: str = "window_first"  # napcat_first | window_first | fullscreen | napcat_only
     cooldown: int = 5
     max_screenshots_per_session: int = 3
     send_as_separate_message: bool = True
@@ -261,7 +263,7 @@ class PluginConfig:
     screenshot_delay_ms: int = 300
     image_quality: int = 85
     max_image_width: int = 1920
-    flip_correction: str = "both"  # none | v | h | both — 截图朝向修正
+    flip_correction: str = "none"  # none | v | h | both — 截图朝向修正
 
     @classmethod
     def from_context(cls, context: Context) -> "PluginConfig":
@@ -274,7 +276,7 @@ class PluginConfig:
         return cls(
             enable=bool(cfg.get("enable", True)),
             inject_system_prompt=bool(cfg.get("inject_system_prompt", True)),
-            screenshot_mode=str(cfg.get("screenshot_mode", "napcat_first")),
+            screenshot_mode=str(cfg.get("screenshot_mode", "window_first")),
             cooldown=_clamp(int(cfg.get("cooldown", 5)), 0, 120),
             max_screenshots_per_session=_clamp(int(cfg.get("max_screenshots_per_session", 3)), 0, 20),
             send_as_separate_message=bool(cfg.get("send_as_separate_message", True)),
@@ -284,7 +286,7 @@ class PluginConfig:
             screenshot_delay_ms=_clamp(int(cfg.get("screenshot_delay_ms", 300)), 0, 2000),
             image_quality=_clamp(int(cfg.get("image_quality", 85)), 10, 100),
             max_image_width=_clamp(int(cfg.get("max_image_width", 1920)), 0, 7680),
-            flip_correction=str(cfg.get("flip_correction", "both")),
+            flip_correction=str(cfg.get("flip_correction", "none")),
         )
 
 
@@ -467,7 +469,7 @@ class Win32ScreenCapture:
             return False
 
     @staticmethod
-    def capture_window(hwnd: int) -> Optional[bytes]:
+    def capture_window(hwnd: int, crop_rect: Optional[Tuple[int, int, int, int]] = None) -> Optional[bytes]:
         """
         使用 PIL ImageGrab 截取指定窗口的屏幕区域。
 
@@ -481,7 +483,19 @@ class Win32ScreenCapture:
         if not rect:
             return None
 
-        bbox = (rect.left, rect.top, rect.right, rect.bottom)
+        left, top, right, bottom = rect.left, rect.top, rect.right, rect.bottom
+        if crop_rect:
+            x, y, w, h = crop_rect
+            # Crop relative to window position
+            new_left = left + x
+            new_top = top + y
+            new_right = new_left + w
+            new_bottom = new_top + h
+            # Ensure it's within the window
+            bbox = (new_left, new_top, min(new_right, right), min(new_bottom, bottom))
+        else:
+            bbox = (left, top, right, bottom)
+            
         try:
             img = ImageGrab.grab(bbox=bbox, all_screens=True)
             return Win32ScreenCapture._pil_to_jpeg(img)
@@ -490,13 +504,18 @@ class Win32ScreenCapture:
             return None
 
     @staticmethod
-    def capture_full_screen() -> Optional[bytes]:
+    def capture_full_screen(crop_rect: Optional[Tuple[int, int, int, int]] = None) -> Optional[bytes]:
         """使用 PIL ImageGrab 截取整个屏幕"""
         if not HAS_PIL:
             logger.error("[NapcatScreenshot] PIL 未安装，无法截图全屏")
             return None
         try:
-            img = ImageGrab.grab(all_screens=True)
+            if crop_rect:
+                x, y, w, h = crop_rect
+                bbox = (x, y, x + w, y + h)
+                img = ImageGrab.grab(bbox=bbox, all_screens=True)
+            else:
+                img = ImageGrab.grab(all_screens=True)
             return Win32ScreenCapture._pil_to_jpeg(img)
         except Exception as e:
             logger.error(f"[NapcatScreenshot] PIL fullscreen capture failed: {e}")
@@ -510,7 +529,7 @@ class Win32ScreenCapture:
         return buf.getvalue()
 
     @staticmethod
-    def capture_target(target: str, delay_ms: int = 300) -> Tuple[Optional[bytes], str]:
+    def capture_target(target: str, delay_ms: int = 300, crop_rect: Optional[Tuple[int, int, int, int]] = None) -> Tuple[Optional[bytes], str]:
         """
         根据目标字符串截图。
 
@@ -539,7 +558,7 @@ class Win32ScreenCapture:
                 wait_ms = max(delay_ms, 200)
                 time.sleep(wait_ms / 1000.0)
 
-                img_bytes = Win32ScreenCapture.capture_window(hwnd)
+                img_bytes = Win32ScreenCapture.capture_window(hwnd, crop_rect)
                 if img_bytes:
                     return img_bytes, f"窗口「{title}」"
                 else:
@@ -556,7 +575,7 @@ class Win32ScreenCapture:
 
         # target 为空 → 全屏
         logger.info("[NapcatScreenshot] Capturing full screen (no target specified)")
-        img_bytes = Win32ScreenCapture.capture_full_screen()
+        img_bytes = Win32ScreenCapture.capture_full_screen(crop_rect)
         if img_bytes:
             return img_bytes, "全屏"
         return None, "截图失败"
@@ -832,6 +851,17 @@ class NapcatScreenshot(Star):
             return
 
         target = (match.group(1) or "").strip()
+        crop_str = (match.group(2) or "").strip()
+
+        crop_rect = None
+        if crop_str:
+            try:
+                # 解析 x,y,w,h
+                parts = [int(p.strip()) for p in re.split(r'[,，\s]+', crop_str) if p.strip()]
+                if len(parts) >= 4:
+                    crop_rect = (parts[0], parts[1], parts[2], parts[3])
+            except Exception as e:
+                logger.warning(f"[NapcatScreenshot] Failed to parse crop rect: {crop_str}, {e}")
 
         # 如果 LLM 没指定窗口，从用户消息中提取
         if not target:
@@ -861,7 +891,7 @@ class NapcatScreenshot(Star):
             return
 
         # ── 执行截图 ──
-        img_bytes, captured_desc = await self._execute_screenshot(target, cfg, event)
+        img_bytes, captured_desc = await self._execute_screenshot(target, crop_rect, cfg, event)
 
         # 移除标记，清理文本
         clean_text = SCREENSHOT_MARKER_RE.sub("", text).strip()
@@ -894,7 +924,7 @@ class NapcatScreenshot(Star):
     # ── 截图执行器 ────────────────────────────────────────────
 
     async def _execute_screenshot(
-        self, target: str, cfg: PluginConfig, event: AstrMessageEvent
+        self, target: str, crop_rect: Optional[Tuple[int, int, int, int]], cfg: PluginConfig, event: AstrMessageEvent
     ) -> Tuple[Optional[bytes], str]:
         """
         截图优先级（从高到低）：
@@ -913,6 +943,14 @@ class NapcatScreenshot(Star):
         #          napcat_first / napcat_only 模式下优先
         # ════════════════════════════════════════════════════════
         if mode in ("napcat_first", "napcat_only"):
+            # 即使使用 NapCat，也尝试把目标窗口置于前台
+            if target:
+                windows = Win32ScreenCapture.find_windows_by_title(target)
+                if windows:
+                    hwnd, title = windows[0]
+                    Win32ScreenCapture.bring_window_to_front(hwnd)
+                    if cfg.screenshot_delay_ms > 0:
+                        await asyncio.sleep(cfg.screenshot_delay_ms / 1000.0)
             try:
                 img_bytes, captured_desc = await self._screenshot_via_bot_client(event)
             except Exception as e:
@@ -928,10 +966,12 @@ class NapcatScreenshot(Star):
                         Win32ScreenCapture.capture_target,
                         target,
                         cfg.screenshot_delay_ms,
+                        crop_rect
                     )
                 else:
                     img_bytes = await asyncio.to_thread(
-                        Win32ScreenCapture.capture_full_screen
+                        Win32ScreenCapture.capture_full_screen,
+                        crop_rect
                     )
                     captured_desc = "全屏"
             except Exception as e:
