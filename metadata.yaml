@@ -5,7 +5,7 @@ desc: >-
   LLM自主决定截图时机与目标窗口，调用QQNT截图展示进度。
   支持指定窗口名截图（如"Claude Code""VS Code"终端"等），
   像真人一样自然地说"让我截图看看进度"。
-version: 1.1.0
+version: 1.1.1
 repo: https://github.com/bentianjia/astrbot_plugin_napcat_screenshot
 support_platforms:
   - aiocqhttp

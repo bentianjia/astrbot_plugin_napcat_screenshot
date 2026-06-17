@@ -264,6 +264,7 @@ class PluginConfig:
     image_quality: int = 85
     max_image_width: int = 1920
     flip_correction: str = "none"  # none | v | h | both — 截图朝向修正
+    allowed_users: str = ""  # 逗号分隔的QQ号列表
 
     @classmethod
     def from_context(cls, context: Context) -> "PluginConfig":
@@ -287,6 +288,7 @@ class PluginConfig:
             image_quality=_clamp(int(cfg.get("image_quality", 85)), 10, 100),
             max_image_width=_clamp(int(cfg.get("max_image_width", 1920)), 0, 7680),
             flip_correction=str(cfg.get("flip_correction", "none")),
+            allowed_users=str(cfg.get("allowed_users", "")),
         )
 
 
@@ -873,6 +875,21 @@ class NapcatScreenshot(Star):
                 )
 
         logger.info(f"[NapcatScreenshot] Screenshot target='{target or '(全屏)'}'")
+
+        # 检查白名单权限
+        if cfg.allowed_users:
+            allowed_list = [u.strip() for u in cfg.allowed_users.split(",") if u.strip()]
+            if allowed_list:
+                uid = ""
+                try:
+                    uid = str(event.get_sender_id())
+                except Exception:
+                    pass
+                if uid not in allowed_list:
+                    logger.warning(f"[NapcatScreenshot] 拦截: 用户 {uid} 尝试截图，但不在白名单内。")
+                    clean_text = SCREENSHOT_MARKER_RE.sub("", text).strip()
+                    event.set_result(event.plain_result(clean_text + "\n\n[系统提示：您没有截图权限]"))
+                    return
 
         # 检查冷却时间
         now = time.time()

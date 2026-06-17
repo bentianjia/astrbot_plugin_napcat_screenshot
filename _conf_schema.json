@@ -14,8 +14,8 @@
   "screenshot_mode": {
     "type": "string",
     "label": "截图模式",
-    "default": "napcat_first",
-    "description": "napcat_first=NapCatQQ截图优先(推荐), window_first=窗口定位优先, fullscreen=PIL全屏, napcat_only=仅NapCat"
+    "default": "window_first",
+    "description": "napcat_first=NapCatQQ截图优先, window_first=窗口定位优先(推荐), fullscreen=PIL全屏, napcat_only=仅NapCat"
   },
   "cooldown": {
     "type": "int",
@@ -74,7 +74,13 @@
   "flip_correction": {
     "type": "string",
     "label": "截图翻转修正",
-    "default": "both",
-    "description": "截图朝向修正: both=上下+左右, v=仅上下, h=仅左右, none=不修正。默认both适应大部分显卡framebuffer"
+    "default": "none",
+    "description": "截图朝向修正: both=上下+左右, v=仅上下, h=仅左右, none=不修正(推荐)。"
+  },
+  "allowed_users": {
+    "type": "string",
+    "label": "允许截图的白名单 (QQ号)",
+    "default": "",
+    "description": "输入允许操控截图的QQ号，多个用逗号隔开。留空则允许任何人（存在隐私泄露风险！）"
   }
 }
