@@ -809,6 +809,98 @@ class NapcatScreenshot(Star):
         self._config = None
         logger.info("[NapcatScreenshot] Plugin unloaded")
 
+    # ── 命令：管理截图配置 ────────────────────────────────────
+
+    @filter.command("jietu")
+    async def jietu_cmd(self, event: AstrMessageEvent, action: str = "", target: str = ""):
+        """管理截图权限
+        /jietu whitelist_add @用户/QQ号
+        /jietu whitelist_remove @用户/QQ号
+        /jietu whitelist_list
+        """
+        cfg = self._get_config()
+        sender_id = ""
+        try:
+            sender_id = str(event.get_sender_id())
+        except Exception:
+            pass
+
+        allowed_list = [u.strip() for u in cfg.allowed_users.split(",") if u.strip()]
+
+        # 权限校验：如果白名单已有内容，只有白名单里的人能管理。
+        # 如果是空的，任何人都可以添加第一个人作为初始管理员。
+        if allowed_list and sender_id not in allowed_list:
+            yield event.plain_result("错误：您没有权限管理截图白名单。")
+            return
+
+        if not action:
+            yield event.plain_result(
+                "用法：\n"
+                "/jietu whitelist_add @用户/QQ号\n"
+                "/jietu whitelist_remove @用户/QQ号\n"
+                "/jietu whitelist_list"
+            )
+            return
+
+        if action == "whitelist_list":
+            if not allowed_list:
+                yield event.plain_result("当前白名单为空，任何人（存在风险）都可以触发截图。")
+            else:
+                yield event.plain_result(f"当前允许截图的 QQ：\n{', '.join(allowed_list)}")
+            return
+
+        # 解析 At 和 target
+        target_qqs = []
+        try:
+            for seg in event.message_obj.message:
+                if type(seg).__name__ == "At":
+                    qq = str(getattr(seg, "qq", getattr(seg, "target", "")))
+                    if qq:
+                        target_qqs.append(qq)
+        except Exception:
+            pass
+
+        # 过滤非数字
+        if target:
+            target_clean = "".join(filter(str.isdigit, target))
+            if target_clean:
+                target_qqs.append(target_clean)
+
+        if not target_qqs:
+            yield event.plain_result("错误：未找到目标用户，请@对方或输入QQ号。")
+            return
+
+        target_qq = target_qqs[0]
+
+        if action == "whitelist_add":
+            if target_qq in allowed_list:
+                yield event.plain_result(f"QQ {target_qq} 已经在白名单中。")
+                return
+            allowed_list.append(target_qq)
+            cfg.allowed_users = ",".join(allowed_list)
+            
+            # 尝试同步到 astrbot 内存中的原始字典
+            raw_cfg = getattr(self.context, "_config", None)
+            if isinstance(raw_cfg, dict):
+                raw_cfg["allowed_users"] = cfg.allowed_users
+                
+            yield event.plain_result(f"成功将 {target_qq} 加入截图白名单。")
+
+        elif action == "whitelist_remove":
+            if target_qq not in allowed_list:
+                yield event.plain_result(f"QQ {target_qq} 不在白名单中。")
+                return
+            allowed_list.remove(target_qq)
+            cfg.allowed_users = ",".join(allowed_list)
+            
+            raw_cfg = getattr(self.context, "_config", None)
+            if isinstance(raw_cfg, dict):
+                raw_cfg["allowed_users"] = cfg.allowed_users
+                
+            yield event.plain_result(f"成功将 {target_qq} 从截图白名单移除。")
+        else:
+            yield event.plain_result("未知指令。用法: whitelist_add, whitelist_remove, whitelist_list")
+
     # ── 阶段 1: 注入截图提示词到 LLM ─────────────────────────
 
     @filter.on_llm_request()
